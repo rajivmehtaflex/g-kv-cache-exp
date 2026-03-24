@@ -1,0 +1,68 @@
+Product Requirements Document (PRD)
+
+Project: Live KV Cache & Prefix Caching Demonstration
+Author: Rajiv Mehta
+
+1. Objective
+
+Visually demonstrate the impact of prompt structure on Time to First Token (TTFT) and inference compute costs by utilizing Automatic Prefix Caching (APC) on a state-of-the-art small language model.
+
+2. Technical Stack & Environment
+
+Hardware: Google Colab (T4 GPU - 16GB VRAM) or equivalent Edge instance.
+
+Inference Engine: vLLM (The enterprise standard for high-throughput serving).
+
+Model: Qwen/Qwen3.5-1.5B-Instruct (or equivalent Qwen3.5 2B). Chosen because its advanced Grouped-Query Attention (GQA) makes it highly efficient for massive KV cache storage on limited VRAM.
+
+Telemetry UI: Python rich library for rendering a real-time terminal dashboard.
+
+3. Configuration Parameters
+
+The vLLM engine must be initialized with the following strict parameters to ensure the demo works on a T4 GPU without Out-Of-Memory (OOM) errors:
+
+enable_prefix_caching=True: The core feature we are demonstrating.
+
+max_model_len=8192: Caps the context window to prevent VRAM overflow.
+
+gpu_memory_utilization=0.85: Reserves 15% of the T4 GPU for system overhead.
+
+4. Demo Execution Steps (The 3 Runs)
+
+The script will generate a massive 6,000-token dummy context (e.g., repeating a financial policy). We will execute three specific runs to demonstrate cache behavior.
+
+Run 1: The Baseline (Cold Cache)
+
+Action: Pass the 6,000-token context to the model. Place the dynamic variables (User ID and User Question) at the BOTTOM of the prompt.
+
+Expected Result: The GPU must compute the attention states for all 6,000 tokens for the first time.
+
+Target Latency: ~2.5 - 4.0 seconds.
+
+Run 2: The Hit (Hot Cache)
+
+Action: Change the User ID and User Question dynamically, but keep them at the BOTTOM. The first 6,000 tokens remain identical to Run 1.
+
+Expected Result: vLLM's APC detects the matching prefix. It bypasses the compute phase and loads the tensors directly from VRAM.
+
+Target Latency: < 0.2 seconds (Massive latency drop).
+
+Run 3: The Enterprise Mistake (Cache Destroyed)
+
+Action: Move the dynamic User ID variable to the TOP of the prompt, right before the 6,000-token context.
+
+Expected Result: Because the sequence changed at token #1, the transformer invalidates the entire 6,000-token cache below it. It is forced to re-compute everything from scratch.
+
+Target Latency: ~2.5 - 4.0 seconds (Latency spikes back to baseline).
+
+5. Telemetry & Output Formatting
+
+The Python script must output a clean, live-updating table using rich.table. It must display:
+
+Run Number
+
+Scenario Description (e.g., "Changed Variable at BOTTOM")
+
+TTFT Latency in seconds (colored Red for Slow, Green for Fast)
+
+Cache Status (MISS (Computed) vs HIT (Reused))
