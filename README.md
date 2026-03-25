@@ -143,3 +143,94 @@ Cache bust:    Run 3 = same latency as Run 1 despite identical document
 | Model | Qwen2.5-1.5B-Instruct | GQA architecture — efficient KV storage |
 | GPU | NVIDIA L4 (24 GB) | sm_89, bfloat16, FlashAttention-2 |
 | UI | Python `rich` | Live terminal table |
+
+---
+
+## KV Cache: Universal vs vLLM-Specific
+
+KV Cache is a **fundamental transformer mechanism** — every inference server implements it. vLLM just adds smarter management on top. Here's the full landscape:
+
+### Layer 1 — Basic KV Cache (Everyone Has This)
+
+Every serious inference engine implements the baseline KV cache (storing K,V tensors per token during generation):
+
+| Engine | Basic KV Cache | Notes |
+|--------|---------------|-------|
+| **vLLM** | Yes | + advanced management on top |
+| **TensorRT-LLM** (NVIDIA) | Yes | Highly optimized for NVIDIA hardware |
+| **TGI** (HuggingFace) | Yes | Also called "past_key_values" in HF transformers |
+| **Ollama** | Yes | Built on llama.cpp underneath |
+| **llama.cpp** | Yes | CPU + GPU, "kv_cache" config |
+| **DeepSpeed-FastGen** (Microsoft) | Yes | |
+| **MLC-LLM** | Yes | |
+| **ExLlamaV2** | Yes | |
+| Raw HuggingFace `transformers` | Yes | `use_cache=True` (default) |
+
+**Bottom line:** if a system runs a transformer model token-by-token, it has a KV cache. No exceptions.
+
+---
+
+### Layer 2 — Prefix Caching (What Our Demo Shows)
+
+This is where engines **diverge**. Reusing KV cache *across separate requests* requires active cache management:
+
+| Engine | Prefix Caching | Details |
+|--------|---------------|---------|
+| **vLLM** | Yes (APC) | Automatic Prefix Caching, hash-based block matching |
+| **TGI** | Partial | Experimental, less mature |
+| **TensorRT-LLM** | Yes | KV Cache Reuse feature |
+| **SGLang** | Yes | RadixAttention — most advanced (tree-based, handles branching) |
+| **llama.cpp** | Partial | Prompt caching (`--prompt-cache`) — file-based, manual |
+| **Ollama** | Yes | Wraps llama.cpp prompt cache automatically |
+| **DeepSpeed-FastGen** | No | Uses SplitFuse instead |
+
+---
+
+### Layer 3 — PagedAttention (vLLM's Core Innovation)
+
+vLLM's biggest unique contribution is **PagedAttention** — it manages KV cache memory like an OS manages RAM pages:
+
+```
+Traditional engines:           vLLM PagedAttention:
+┌──────────────────────┐       ┌──────────────────────┐
+│ Request A: [████████]│       │ Request A: [pg1][pg3] │  ← non-contiguous
+│ Request B: [██░░░░░░]│       │ Request B: [pg2][pg5] │     pages in VRAM
+│ (░ = wasted VRAM)    │       │ (zero internal waste) │
+└──────────────────────┘       └──────────────────────┘
+```
+
+- Traditional: pre-allocates a contiguous VRAM block per request → massive waste (up to 60-80% fragmentation)
+- PagedAttention: allocates fixed-size blocks (pages) on demand → near-zero waste → fits more requests in VRAM
+
+---
+
+### Layer 4 — SGLang's RadixAttention (Most Advanced)
+
+[SGLang](https://github.com/sgl-project/sglang) from the Berkeley Sky Computing Lab goes further than vLLM's flat prefix matching:
+
+```
+vLLM APC (linear prefix only):    SGLang RadixAttention (tree):
+  [System][DocA][Q1] → cache        [System] ─┬─ [DocA] ─┬─ [Q1]
+  [System][DocA][Q2] → cache                  │           └─ [Q2]
+  [System][DocB][Q1] → no sharing             └─ [DocB] ─── [Q1]
+                                          ↑ shares [System] node across ALL branches
+```
+
+RadixAttention can share cache at any branching point in a tree of prompts — useful for multi-turn chat, tree-of-thought, and batch prompt variations.
+
+---
+
+### Summary for Your Conference
+
+```
+Basic KV Cache          ← every engine, non-negotiable
+    │
+    ├── Prefix Caching  ← vLLM, TensorRT-LLM, SGLang, Ollama
+    │       └── RadixAttention (SGLang) ← most advanced, tree-based sharing
+    │
+    └── PagedAttention  ← vLLM's core memory mgmt innovation
+                           (TensorRT-LLM has a similar paging system)
+```
+
+**One-liner for your audience:**
+> "KV Cache is in every LLM runtime. vLLM's contribution is *how* it manages that cache — PagedAttention eliminates memory waste, and Automatic Prefix Caching eliminates redundant compute across requests. Both effects are what our demo measures."
