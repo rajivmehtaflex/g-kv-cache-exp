@@ -18,7 +18,7 @@ TARGET_CONTEXT_TOKENS = 6000
 MAX_MODEL_LEN = 8192
 GPU_UTIL = 0.85
 MAX_NEW_TOKENS = 1          # max_tokens=1 gives cleanest TTFT measurement
-TTFT_HIT_THRESHOLD = 0.5   # seconds: below = HIT, above = MISS
+TTFT_HIT_THRESHOLD = 0.2   # seconds: below = HIT, above = MISS (L4 cold ~0.4s, hot ~0.06s)
 
 
 # Section 2 — generate_context()
@@ -52,7 +52,7 @@ def make_table(rows_data: list) -> Table:
     table.add_column("Cache Status", width=20, justify="center")
 
     for row in rows_data:
-        run_num, scenario, ttft_display, cache_display = row
+        run_num, scenario, ttft_display, cache_display = row[0], row[1], row[2], row[3]
         table.add_row(str(run_num), scenario, ttft_display, cache_display)
 
     return table
@@ -72,6 +72,10 @@ def run_experiment(llm: LLM, context: str, live: Live, rows_data: list) -> None:
         {
             "run_num": 1,
             "scenario": "Cold Cache (variable at BOTTOM)",
+            "narration": (
+                "Run 1: Sending the 6,000-token document for the FIRST time.\n"
+                "       The GPU has no cached state — it must compute attention for every token."
+            ),
             "get_prompt": lambda ctx: (
                 f"[SYSTEM: Financial Policy Assistant]\n"
                 f"{ctx}\n\n"
@@ -82,6 +86,10 @@ def run_experiment(llm: LLM, context: str, live: Live, rows_data: list) -> None:
         {
             "run_num": 2,
             "scenario": "Hot Cache (same prefix, variable BOTTOM)",
+            "narration": (
+                "Run 2: Same 6,000-token prefix — only the User ID and Question changed (at BOTTOM).\n"
+                "       vLLM detects the matching prefix and loads KV tensors directly from VRAM."
+            ),
             "get_prompt": lambda ctx: (
                 f"[SYSTEM: Financial Policy Assistant]\n"
                 f"{ctx}\n\n"
@@ -92,6 +100,10 @@ def run_experiment(llm: LLM, context: str, live: Live, rows_data: list) -> None:
         {
             "run_num": 3,
             "scenario": "Cache Destroyed (variable at TOP)",
+            "narration": (
+                "Run 3: User ID moved to the TOP of the prompt — before the 6,000-token context.\n"
+                "       The prefix now differs at token #1. The entire cached KV state is invalid."
+            ),
             "get_prompt": lambda ctx: (
                 f"User ID: USR-{uuid.uuid4().hex[:8]}\n\n"
                 f"[SYSTEM: Financial Policy Assistant]\n"
@@ -101,13 +113,18 @@ def run_experiment(llm: LLM, context: str, live: Live, rows_data: list) -> None:
         },
     ]
 
+    console = live.console
     for run in runs:
+        # Print narration above the live table
+        console.print(f"\n[dim]{run['narration']}[/]")
+
         # Add "Running..." placeholder row
         rows_data.append((
             str(run["run_num"]),
             run["scenario"],
             Text("Running...", style="dim"),
             Text("...", style="dim"),
+            None,  # raw ttft float (not yet known)
         ))
         live.update(make_table(rows_data))
 
@@ -122,8 +139,8 @@ def run_experiment(llm: LLM, context: str, live: Live, rows_data: list) -> None:
             style="green" if is_hit else "red",
         )
 
-        # Replace placeholder with result
-        rows_data[-1] = (str(run["run_num"]), run["scenario"], ttft_text, cache_text)
+        # Replace placeholder with result (5-tuple: last field = raw float for speedup calc)
+        rows_data[-1] = (str(run["run_num"]), run["scenario"], ttft_text, cache_text, ttft)
         live.update(make_table(rows_data))
 
 
@@ -138,11 +155,9 @@ def main() -> None:
         enable_prefix_caching=True,
         max_model_len=MAX_MODEL_LEN,
         gpu_memory_utilization=GPU_UTIL,
-        dtype="float16",          # T4 (sm_75) has no bfloat16 hardware support
+        dtype="auto",             # bfloat16 works natively on L4 (sm_89)
         trust_remote_code=True,
         tensor_parallel_size=1,
-        enforce_eager=True,       # Disables CUDA graphs — required on T4 (sm_75)
-        enable_chunked_prefill=True,  # Avoids context_attention_fwd Triton kernel (broken on T4+Triton3.x)
     )
 
     console.print("[bold cyan]Building 6000-token context...[/]")
@@ -152,11 +167,40 @@ def main() -> None:
     actual_tokens = len(enc.encode(context))
     console.print(f"[dim]Context size: {actual_tokens} tokens[/]")
 
+    console.rule("[bold cyan]KV Cache & Prefix Caching Live Demo[/]")
+    console.print(
+        "\n[bold]What you are about to see:[/]\n"
+        "  A [bold]6,000-token[/] financial policy is sent to the model [bold]3 times[/].\n"
+        "  The [bold]only[/] difference between runs is [underline]where[/] the User ID is placed.\n\n"
+        "  [green]Run 1[/]  Cold cache   — first request, GPU computes everything  (slow)\n"
+        "  [green]Run 2[/]  Hot cache    — identical prefix, KV tensors reused      (fast)\n"
+        "  [red]Run 3[/]  Cache bust   — User ID moved to TOP, cache invalidated  (slow again)\n"
+    )
+    console.rule()
+
     rows_data = []
     with Live(make_table(rows_data), console=console, refresh_per_second=4) as live:
         run_experiment(llm, context, live, rows_data)
 
-    console.print("\n[bold green]Demo complete.[/]")
+    # Final speedup summary
+    baseline_ttft = rows_data[0][4]   # Run 1 raw float
+    hit_ttft      = rows_data[1][4]   # Run 2 raw float
+    bust_ttft     = rows_data[2][4]   # Run 3 raw float
+
+    console.rule()
+    speedup = baseline_ttft / hit_ttft
+    console.print(
+        f"\n[bold green]Cache speedup:[/]  [bold]{speedup:.1f}x faster[/]"
+        f"  (Run 2 vs Run 1: {hit_ttft:.3f}s vs {baseline_ttft:.3f}s)"
+    )
+    console.print(
+        f"[bold red]Cache bust:[/]     Run 3 ({bust_ttft:.3f}s) = same latency as Run 1"
+        f" despite the document being identical."
+    )
+    console.print(
+        "\n[bold]Golden rule:[/] put [green]static content[/] (system prompt, documents)"
+        " at the [green]TOP[/]; [red]dynamic variables[/] (user ID, query) at the [red]BOTTOM[/].\n"
+    )
 
 
 if __name__ == "__main__":
