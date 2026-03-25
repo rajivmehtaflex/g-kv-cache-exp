@@ -234,3 +234,272 @@ Basic KV Cache          ← every engine, non-negotiable
 
 **One-liner for your audience:**
 > "KV Cache is in every LLM runtime. vLLM's contribution is *how* it manages that cache — PagedAttention eliminates memory waste, and Automatic Prefix Caching eliminates redundant compute across requests. Both effects are what our demo measures."
+
+---
+
+## How KV Cache Stores Itself — Physical Storage
+
+### Where Does It Live?
+
+KV Cache lives in **GPU VRAM** (not CPU RAM, not disk):
+
+```
+GPU Memory Layout:
+┌─────────────────────────────────────────┐
+│  Model Weights (loaded once)            │  ← 1.5B model ≈ 3 GB
+├─────────────────────────────────────────┤
+│  Activations (computed during forward)  │  ← temporary, freed after
+├─────────────────────────────────────────┤
+│  KV Cache (grows with sequence length)  │  ← THIS IS WHAT WE STORE
+├─────────────────────────────────────────┤
+│  Free VRAM                              │
+└─────────────────────────────────────────┘
+```
+
+**Why GPU?** Because the model needs to access K and V vectors **in nanoseconds** during attention computation. Moving them to CPU RAM would be 100-1000× slower (PCIe bottleneck).
+
+---
+
+### Data Format: Tensors (Multi-Dimensional Arrays)
+
+KV Cache is stored as **PyTorch tensors** (or similar: TensorFlow, JAX). Here's the shape:
+
+```
+K tensor: [batch_size, num_heads, seq_length, head_dim]
+V tensor: [batch_size, num_heads, seq_length, head_dim]
+
+Example for Qwen2.5-1.5B (our demo):
+- batch_size = 1 (one request)
+- num_heads = 12 (model has 12 attention heads)
+- seq_length = 6000 (our demo's context)
+- head_dim = 128 (hidden_size=1536 ÷ 12 heads)
+
+K shape: [1, 12, 6000, 128]
+V shape: [1, 12, 6000, 128]
+
+Memory per tensor:
+  1 × 12 × 6000 × 128 × 2 bytes (float16) = 18.4 MB per tensor
+  Total K + V = 36.8 MB for one 6000-token request
+```
+
+For a SaaS system with 1,000 concurrent requests:
+```
+36.8 MB × 1,000 = 36.8 GB of VRAM just for KV cache
+```
+This is why L4's 24 GB VRAM becomes limiting at scale — and why PagedAttention (vLLM) is so important.
+
+---
+
+### Data Type: Which Precision?
+
+KV Cache can be stored in different precisions:
+
+| Dtype | Bytes per Value | Memory for 6k tokens (1 batch) | Notes |
+|-------|-----------------|-------------------------------|-------|
+| float32 | 4 bytes | 73.7 MB | Full precision, rarely used (wastes memory) |
+| float16 | 2 bytes | 36.8 MB | **Most common** (GPU native, fast) |
+| bfloat16 | 2 bytes | 36.8 MB | Better numerical stability than float16 |
+| int8 | 1 byte | 18.4 MB | Quantized (lossy), experimental |
+
+**Our demo (L4 GPU):** automatically uses `bfloat16` because L4 has hardware support for it. Older T4 uses `float16`.
+
+---
+
+### How Tokens Are Added to Cache (Step-by-Step)
+
+**Token 1 (first word):**
+```
+Input: "Financial"
+  ↓
+GPU computes:
+  K_1 = attention_key_projection(embedding_1)      [shape: 12×128]
+  V_1 = attention_value_projection(embedding_1)    [shape: 12×128]
+  ↓
+Store in cache:
+  K_cache[0, :, 0, :] = K_1    ← slot 0, all heads
+  V_cache[0, :, 0, :] = V_1
+
+Cache state: [1, 12, 1, 128] — only 1 token stored
+```
+
+**Token 2 (second word):**
+```
+Input: "Policy"
+  ↓
+Load from cache:
+  K_prev = K_cache[0, :, 0:1, :]    ← retrieve token 1 (INSTANT)
+  V_prev = V_cache[0, :, 0:1, :]
+  ↓
+Compute new:
+  K_2 = attention_key_projection(embedding_2)
+  V_2 = attention_value_projection(embedding_2)
+  ↓
+Append to cache:
+  K_cache[0, :, 1, :] = K_2
+  V_cache[0, :, 1, :] = V_2
+
+Cache state: [1, 12, 2, 128] — now 2 tokens stored
+```
+
+**Token 6000 (last token):**
+```
+Attention computation looks at ALL previous 5999 tokens:
+  scores = Q_6000 @ K_cache[0, :, 0:6000, :].T     ← direct VRAM access
+  weights = softmax(scores)
+  output = weights @ V_cache[0, :, 0:6000, :]
+
+Notice: K and V from tokens 1-5999 are **already in VRAM**. No recomputation.
+```
+
+---
+
+### Physical Layout in GPU Memory: PagedAttention
+
+**Standard approach (wastes memory):**
+```
+Request 1: [K,V for tokens 1-100] allocated as one huge block
+Request 2: [K,V for tokens 1-50]  allocated as one huge block
+Request 3: [K,V for tokens 1-150] allocated as one huge block
+
+Fragmented memory:
+┌─────────────────────────────────┐
+│ Req1 [████████████] 100 tokens  │  ← fully used
+├─────────────────────────────────┤
+│ Req2 [██████] 50 tokens         │
+│     [░░░░░░░░░░░░░░░░░] empty   │  ← wasted (fragmentation)
+├─────────────────────────────────┤
+│ Req3 [██████████████████] 150   │  ← requires new allocation
+├─────────────────────────────────┤
+│ Free space (too scattered)      │
+└─────────────────────────────────┘
+```
+
+**vLLM's PagedAttention (smarter approach):**
+```
+Fixed 16-token "pages" allocated on-demand:
+┌──────┐
+│Page1 │ Req1: tokens 1-16
+├──────┤
+│Page2 │ Req1: tokens 17-32
+├──────┤
+│Page3 │ Req2: tokens 1-16
+├──────┤
+│Page4 │ Req3: tokens 1-16
+├──────┤
+│Page5 │ Req1: tokens 33-48
+├──────┤
+│Page6 │ Req3: tokens 17-32
+├──────┤
+│Page7 │ FREE (ready to allocate)
+└──────┘
+
+Requests can use non-contiguous pages
+→ near-zero fragmentation
+→ fits 2-3× more concurrent requests in same VRAM
+```
+
+---
+
+### Prefix Caching Storage: Deduplication
+
+When two requests share a prefix, vLLM doesn't duplicate the K,V tensors:
+
+**Without Prefix Caching:**
+```
+Request A: [System Prompt] + [Doc] + [Q1]
+  Stores: K,V for all 6000 tokens
+  Memory: 36.8 MB
+
+Request B: [System Prompt] + [Doc] + [Q2]   (same prefix as A)
+  Stores: K,V for all 6000 tokens AGAIN
+  Memory: 36.8 MB
+
+Total: 73.6 MB (wasteful!)
+```
+
+**With Prefix Caching (vLLM's APC):**
+```
+Request A: [System Prompt] + [Doc] + [Q1]
+  Computes & Stores: K,V for all 6000 tokens
+  Memory: 36.8 MB
+
+Request B: [same prefix] + [Q2]
+  Checks hash of prefix:
+    hash("SystemPrompt+Doc") matches Request A's prefix hash
+  ↓
+  Reuses: K,V cache from Request A (pages 1-375)
+  Computes only: K,V for new tokens (Q2)
+  Memory: 36.8 MB × 1 + overhead for Request B's tail
+
+Total: ~40 MB (shared prefix not duplicated!)
+```
+
+The hash is computed over the token sequence. If even one token differs, the hash changes and cache is not shared.
+
+---
+
+### Memory Lifecycle: When Does Cache Die?
+
+```
+Request arrives with 1000 tokens
+  ↓
+[vLLM allocates pages for K,V cache]
+  ↓
+Model generates token 1 → add to cache
+Model generates token 2 → add to cache
+  ... (cache keeps growing)
+Model generates token 100 (STOP token)
+  ↓
+[Request complete]
+  ↓
+Pages are freed and returned to pool
+  ↓
+Next request can reuse those pages (no allocation overhead)
+```
+
+If the same request makes 5 different API calls with a shared prompt:
+```
+Call 1: [Shared prompt] + Q1  → cache built, 36.8 MB stored
+Call 2: [Shared prompt] + Q2  → reuse cache from Call 1 (instant)
+Call 3: [Shared prompt] + Q3  → reuse cache from Call 1 (instant)
+Call 4: [Shared prompt] + Q4  → reuse cache from Call 1 (instant)
+Call 5: [Shared prompt] + Q5  → reuse cache from Call 1 (instant)
+
+Only computed once. Reused 4 times.
+Memory: 36.8 MB + small overhead per call
+Compute saved: equivalent to 4 × 1000 token forward passes
+```
+
+---
+
+### Practical Example: Our Demo
+
+```
+Qwen2.5-1.5B model:
+├─ Model weights: ~3 GB
+├─ Per-request KV cache (6000 tokens):
+│   K: [1, 12, 6000, 128] @ float16 = 18.4 MB
+│   V: [1, 12, 6000, 128] @ float16 = 18.4 MB
+│   Total: 36.8 MB
+│
+└─ GPU VRAM utilization:
+    Model: 3 GB
+    KV for Request 1: 36.8 MB
+    KV for Requests 2-3 (prefix reused): ~1 MB each (only tail)
+    Activations + temp: ~500 MB
+    ─────────────────
+    Total: ~4.1 GB / 24 GB (L4) = 17% utilization
+```
+
+---
+
+### Key Takeaways for Your Conference
+
+1. **KV Cache = GPU VRAM tensors** — fast, local storage, multi-dimensional arrays
+2. **Size grows with sequence length** — longer context = more memory required
+3. **Precision matters** — float16/bfloat16 are standard, int8 experimental
+4. **PagedAttention fragments smartly** — paging eliminates 60-80% memory waste
+5. **Prefix caching deduplicates** — hash-based matching prevents redundant storage
+6. **Once computed, reused immediately** — cache access is nanosecond-level, nearly free
+
+The demo shows this: Run 1 computes & stores, Run 2 reuses (8.4× faster), Run 3 breaks the cache by changing token #1 (recompute required).
