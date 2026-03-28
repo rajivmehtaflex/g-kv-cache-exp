@@ -1,5 +1,8 @@
 # Section 1 — Imports & Constants
 import math
+import os
+import subprocess
+import sys
 import time
 import uuid
 
@@ -17,6 +20,7 @@ MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
 TARGET_CONTEXT_TOKENS = 6000
 MAX_MODEL_LEN = 8192
 GPU_UTIL = 0.85
+MIN_FREE_GPU_GIB = 4.0
 MAX_NEW_TOKENS = 1          # max_tokens=1 gives cleanest TTFT measurement
 TTFT_HIT_THRESHOLD = 0.2   # seconds: below = HIT, above = MISS (L4 cold ~0.4s, hot ~0.06s)
 
@@ -64,6 +68,74 @@ def measure_ttft(llm: LLM, prompt: str) -> float:
     t0 = time.perf_counter()
     llm.generate([prompt], sampling_params=sampling)
     return time.perf_counter() - t0
+
+
+def _run_text_command(args: list[str]) -> str:
+    result = subprocess.run(args, check=True, capture_output=True, text=True)
+    return result.stdout.strip()
+
+
+def find_conflicting_gpu_processes() -> list[tuple[int, str]]:
+    try:
+        raw_pids = _run_text_command([
+            "nvidia-smi",
+            "--query-compute-apps=pid",
+            "--format=csv,noheader,nounits",
+        ])
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return []
+
+    conflicts = []
+    for line in raw_pids.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        pid = int(line)
+        if pid == os.getpid():
+            continue
+
+        try:
+            cmdline = open(f"/proc/{pid}/cmdline", "r", encoding="utf-8").read()
+        except OSError:
+            continue
+
+        rendered = cmdline.replace("\x00", " ").strip()
+        if os.path.basename(sys.argv[0]) in rendered:
+            conflicts.append((pid, rendered))
+
+    return conflicts
+
+
+def get_effective_gpu_utilization(console: Console) -> float:
+    try:
+        raw = _run_text_command([
+            "nvidia-smi",
+            "--query-gpu=memory.total,memory.free",
+            "--format=csv,noheader,nounits",
+        ])
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return GPU_UTIL
+
+    total_mib, free_mib = (int(part.strip()) for part in raw.splitlines()[0].split(","))
+    free_gib = free_mib / 1024
+    total_gib = total_mib / 1024
+
+    if free_gib < MIN_FREE_GPU_GIB:
+        raise RuntimeError(
+            f"Only {free_gib:.2f} GiB of {total_gib:.2f} GiB GPU memory is free. "
+            f"Free at least {MIN_FREE_GPU_GIB:.1f} GiB and retry."
+        )
+
+    free_fraction = free_mib / total_mib
+    effective_util = min(GPU_UTIL, max(0.10, free_fraction - 0.02))
+    if effective_util < GPU_UTIL:
+        console.print(
+            f"[yellow]Reducing gpu_memory_utilization from {GPU_UTIL:.2f} to "
+            f"{effective_util:.2f} based on current free GPU memory.[/]"
+        )
+
+    return effective_util
 
 
 # Section 5 — run_experiment()
@@ -150,11 +222,21 @@ def main() -> None:
     console.print("[bold cyan]Initializing vLLM engine...[/]")
     console.print(f"[dim]Model: {MODEL_ID}[/]")
 
+    conflicts = find_conflicting_gpu_processes()
+    if conflicts:
+        details = ", ".join(f"PID {pid} ({cmd})" for pid, cmd in conflicts)
+        raise RuntimeError(
+            "Another GPU process from this demo is already running. "
+            f"Stop it before launching a new copy: {details}"
+        )
+
+    gpu_util = get_effective_gpu_utilization(console)
+
     llm = LLM(
         model=MODEL_ID,
         enable_prefix_caching=True,
         max_model_len=MAX_MODEL_LEN,
-        gpu_memory_utilization=GPU_UTIL,
+        gpu_memory_utilization=gpu_util,
         dtype="auto",             # bfloat16 works natively on L4 (sm_89)
         trust_remote_code=True,
         tensor_parallel_size=1,
